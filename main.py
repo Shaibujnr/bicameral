@@ -1,3 +1,4 @@
+from threading import Lock
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from typing import Any
 from collections import defaultdict
@@ -16,7 +17,10 @@ class MatchedDocument:
 	document: dict[str, Any] # the document
 
 
-samples_store = [
+class MockStorage:
+	def __init__(self):
+		self._lock = Lock()
+		self._samples_store: list[dict[str, Any]] = [
 		{
 			"Id": "001",
 			"Customer Name": "Redline Auto Center",
@@ -72,9 +76,48 @@ samples_store = [
 			"Comments": ""
 		}
 	]
-unmatched_documents_store: list[dict[str, Any]] = [] # holds list of documents that did not match any sample
-matched_documents_store: list[MatchedDocument] = [] # holds list of documents that matched a sample
-match_store = defaultdict(list) # holds a mapping between the sample and it's matching documents
+		self._unmatched_documents_store: list[dict[str, Any]] = [] # holds list of documents that did not match any sample
+		self._matched_documents_store: list[MatchedDocument] = [] # holds list of documents that matched a sample
+		self._match_store = defaultdict(list) # holds a mapping between the sample and it's matching documents
+
+	def fetch_samples(self) -> list[dict[str, Any]]:
+		return self._samples_store
+	
+	def fetch_matched_documents(self) -> list[MatchedDocument]:
+		with self._lock:
+			return self._matched_documents_store
+
+	def fetch_unmatched_documents(self) -> list[dict[str, Any]]:
+		with self._lock:
+			return self._unmatched_documents_store
+
+	def get_match(self) -> dict[str, list[dict[str, Any]]]:
+		with self._lock:
+			return self._match_store
+
+	def add_unmatched_document(self, document: dict[str, Any]) -> None:
+		with self._lock:
+			self._unmatched_documents_store.append(document)
+
+	def save_matched_document(self, matched_document: MatchedDocument) -> None:
+		with self._lock:
+			self._matched_documents_store.append(matched_document)
+			self._match_store[matched_document.sample_id].append(matched_document.document)
+
+	def remove_unmatched_document(self, document: dict[str, Any]) -> None:
+		with self._lock:
+			self._unmatched_documents_store.remove(document)
+
+	def replace_matched_document(self, old_matched_document: MatchedDocument, new_matched_document: MatchedDocument) -> None:
+		with self._lock:
+			self._matched_documents_store.remove(old_matched_document)
+			self._match_store[old_matched_document.sample_id].remove(old_matched_document.document)
+			self._matched_documents_store.append(new_matched_document)
+			self._match_store[new_matched_document.sample_id].append(new_matched_document.document)
+
+
+storage = MockStorage()
+			
 
 def get_values(data: list[Any]|dict[str, Any]) -> list[Any]:
 	"""
@@ -114,13 +157,15 @@ def match_document(document: dict[str, Any]) -> MatchedDocument|None:
 	max_match_score = 0
 	matching_sample_id = None
 	# check document against each sample
-	for sample in samples_store:
+	samples = storage.fetch_samples()
+	for sample in samples:
 		match_score = compute_match_score(document, sample)
 		if match_score > max_match_score:
 			max_match_score = match_score
 			matching_sample_id = sample["Id"]
 	# check document against previously matched documents
-	for matched_document in matched_documents_store:
+	matched_documents = storage.fetch_matched_documents()
+	for matched_document in matched_documents:
 		match_score = compute_match_score(document, matched_document.document)
 		if match_score > max_match_score:
 			max_match_score = match_score
@@ -133,18 +178,18 @@ def save_matched_document(matched_document: MatchedDocument) -> None:
 	"""
 	Store/Persist matched document
 	"""
-	matched_documents_store.append(matched_document)
-	match_store[matched_document.sample_id].append(matched_document.document)
+	storage.save_matched_document(matched_document)
 
 def match_unmatched_documents_task(matched_document: MatchedDocument) -> None:
 	"""
 	This task will check each unmatched document against the provided matched document and match them if they match.
 	"""
 	logger.info("Matching unmatched documents")
-	for unmatched_document in unmatched_documents_store:
+	unmatched_documents = storage.fetch_unmatched_documents()
+	for unmatched_document in unmatched_documents:
 		match_score = compute_match_score(unmatched_document, matched_document.document)
 		if match_score > 0:
-			unmatched_documents_store.remove(unmatched_document)
+			storage.remove_unmatched_document(unmatched_document)
 			new_matched_document = MatchedDocument(
 				sample_id=matched_document.sample_id,
 				document=unmatched_document,
@@ -155,12 +200,13 @@ def match_unmatched_documents_task(matched_document: MatchedDocument) -> None:
 			logger.info(new_matched_document)
 	logger.info("Done matching unmatched documents")
 
-def rematch_matched_documents_task(matched_document: MatchedDocument):
+def rematch_matched_documents_task(matched_document: MatchedDocument) -> None:
 	"""
 	This task will check each matched document against the provided newly matched document and rematch them if they match better.
 	"""
 	logger.info("Matching matched documents")
-	for already_matched_document in matched_documents_store:
+	matched_documents = storage.fetch_matched_documents()
+	for already_matched_document in matched_documents:
 		match_score = compute_match_score(already_matched_document.document, matched_document.document)
 		if match_score > already_matched_document.match_score:
 			logger.info(f"Found better match, old match score {already_matched_document.match_score} and new match score {match_score}")
@@ -169,8 +215,7 @@ def rematch_matched_documents_task(matched_document: MatchedDocument):
 				document=already_matched_document.document,
 				match_score=match_score
 			)
-			save_matched_document(new_match)
-			match_store[already_matched_document.sample_id].remove(already_matched_document.document)
+			storage.replace_matched_document(already_matched_document, new_match)
 			logger.info(f"Matched document has been rematched. Old sample Id {already_matched_document.sample_id} and New Sample Id {matched_document.sample_id}")
 	logger.info("Done matching matched documents")
 
@@ -191,7 +236,7 @@ async def process_document(document: dict[str, Any], background_tasks: Backgroun
 		# check if already matched documents match better with this new document and rematch them
 		background_tasks.add_task(rematch_matched_documents_task, matched_document)
 	else:
-		unmatched_documents_store.append(document)
+		storage.add_unmatched_document(document)
 		raise HTTPException(status_code=404, detail="No matching sample found")
 
 		
@@ -202,4 +247,4 @@ def get_match():
 	"""
 	Get the match dictionary
 	"""
-	return match_store
+	return storage.get_match()
